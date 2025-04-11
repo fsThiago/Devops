@@ -1,0 +1,428 @@
+trigger:
+- prd-aws
+- hml-aws
+- dev-aws
+
+variables:
+- name: sourceHelmChartDirectory
+  value: $(Build.SourcesDirectory)/pipeline/chart-aws
+- name: destinationHelmChartDirectory
+  value: $(Agent.TempDirectory)/chart
+- name: destinationHelmChartPackage
+  value: $(destinationHelmChartDirectory)/$(Helm.chartName)-$(Build.BuildId).tgz
+- name: ociHelmRepositoryUrl
+  value: oci://$(Docker.containerRegistry.url)
+- name: kubectlVersion
+  value: 1.25.0
+- name: helmVersion
+  value: 3.9.0
+- ${{ if eq(variables['build.SourceBranchName'], 'dev-aws') }}:
+  - group: portoseguro-middleware-dev-aws
+- ${{ if eq(variables['build.SourceBranchName'], 'hml-aws') }}:
+  - group: portoseguro-middleware-hml-aws
+- ${{ if eq(variables['build.SourceBranchName'], 'prd-aws') }}:
+  - group: portoseguro-middleware-prd-aws
+
+pool:
+  vmImage: ubuntu-latest
+
+name: 1.0.$(Rev:r)
+
+stages:
+
+- stage: build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build
+    steps:
+    - task: UseDotNet@2
+      displayName: Use .NET Core sdk 8.x
+      inputs:
+        packageType: sdk
+        version: 8.x
+        includePreviewVersions: false
+    
+    - task: DotNetCoreCLI@2
+      displayName: dotnet restore
+      inputs:
+        command: 'restore'
+        projects: 'src/**/*.csproj'
+        feedsToUse: 'select'
+        vstsFeed: '$(AzureDevOps.NugetFeed)'
+
+    - script: |
+        echo "Verificando arquivos de projeto..."
+        find . -name "*.csproj"
+      displayName: 'Listar arquivos .csproj'
+    
+    - script: |
+       echo "Verificando a estrutura de diretórios..."
+       ls -R $(Build.SourcesDirectory)
+      displayName: 'Verificar arquivos no repositório'
+
+
+    - task: DotNetCoreCLI@2
+      displayName: dotnet build
+      inputs:
+        command: 'build'
+        projects: '$(Build.SourcesDirectory)/src/**/*.csproj'
+
+- stage: BuildAndPushDockerImage
+  displayName: Build and push Docker stage
+  dependsOn: build
+
+  jobs:
+
+  - job: BuildAndPushImage
+    displayName: Build and Push Docker Image
+
+    pool:
+      vmImage: $(AzureDevOps.vmImageName)
+
+    steps:
+
+    - script: echo $(System.AccessToken)
+
+    - task: Docker@2
+      displayName: Build Docker Image
+      inputs:
+        repository: $(Docker.containerRegistry.imageRepository)
+        command: build
+        buildContext: .
+        Dockerfile: $(Docker.filePath)
+        tags: |
+          latest
+          $(Build.BuildId)
+        arguments: --build-arg PAT=$(System.AccessToken)
+
+    - task: AWSShellScript@1
+      displayName: Create API Image Repository
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        failOnStandardError: true
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names '$(Docker.containerRegistry.imageRepository)' > /dev/null 2>&1 || aws ecr create-repository \
+          --region $(AWS.region) \
+          --registry-id $(AWS.accountId) \
+          --repository-name $(Docker.containerRegistry.imageRepository) \
+          --image-tag-mutability $(Docker.ContainerRegistry.tagMutability) \
+          --image-scanning-configuration scanOnPush=$(Docker.ContainerRegistry.scanOnPush) \
+          --encryption-configuration encryptionType=$(Docker.ContainerRegistry.encryptionType) > /dev/null 2>&1
+
+    - task: ECRPushImage@1
+      displayName: Push Docker Image
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        sourceImageName: $(Docker.containerRegistry.imageRepository)
+        sourceImageTag: $(Docker.imageTag)
+        repositoryName: $(Docker.containerRegistry.imageRepository)
+        pushTag: $(Docker.imageTag)
+
+- stage: PackageAndPushHelm
+  displayName: Build and push HELM stage
+  dependsOn: BuildAndPushDockerImage
+
+  jobs:
+
+  - job: PackageAndPushHelm
+    displayName: Package And Push Helm
+
+    pool:
+      vmImage: $(AzureDevOps.vmImageName)
+
+    steps:
+
+    - task: HelmInstaller@0
+      displayName: Install Helm
+      inputs:
+        helmversion: $(helmVersion)
+        kubectlVersion: $(kubectlVersion)
+        checkLatestHelmVersion: false
+
+    - task: replacetokens@5
+      displayName: Replace tokens in Namespace
+      inputs:
+        targetFiles: $(sourceHelmChartDirectory)/namespace.yaml
+        encoding: auto
+        tokenPattern: default
+        writeBOM: true
+        actionOnMissing: warn
+        keepToken: false
+        actionOnNoFiles: continue
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        enableTelemetry: true
+
+    - task: replacetokens@5
+      displayName: Replace tokens in Chart.yaml
+      inputs:
+        targetFiles: $(sourceHelmChartDirectory)/Chart.yaml
+        encoding: auto
+        tokenPattern: default
+        writeBOM: true
+        actionOnMissing: warn
+        keepToken: false
+        actionOnNoFiles: continue
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        enableTelemetry: true
+
+    - script: helm lint $(sourceHelmChartDirectory)
+      displayName: Lint Helm chart
+
+    - task: AWSShellScript@1
+      displayName: Package & Push
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        failOnStandardError: true
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+          aws ecr get-login-password --region $(AWS.region) | helm registry login --username AWS --password-stdin $(Docker.containerRegistry.url)
+          aws ecr describe-repositories --repository-names '$(Helm.chartName)' > /dev/null 2>&1 || aws ecr create-repository --region $(AWS.region) --registry-id $(AWS.accountId) \
+          --repository-name $(Helm.chartName) --image-tag-mutability $(Docker.ContainerRegistry.tagMutability) --image-scanning-configuration scanOnPush=$(Docker.ContainerRegistry.scanOnPush) \
+          --encryption-configuration encryptionType=$(Docker.ContainerRegistry.encryptionType)
+          helm package $(sourceHelmChartDirectory) --version $(Build.BuildId) --app-version $(Build.BuildId) --dependency-update --destination $(destinationHelmChartDirectory) --debug 2>&1
+          helm push $(destinationHelmChartPackage) $(ociHelmRepositoryUrl) --debug 2>&1
+
+    - script: helm registry logout $(Docker.containerRegistry.url) || true
+      condition: always()
+      displayName: Registry Logout
+    - upload: $(destinationHelmChartPackage)
+      displayName: Upload Artifact
+      artifact: destination-helm-chart
+    - upload: $(sourceHelmChartDirectory)
+      artifact: source-helm-chart
+
+- stage: DeployHelmIntoK8s
+  displayName: Deploy Helm into EKS (AWS)
+  dependsOn: PackageAndPushHelm
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(AzureDevOps.vmImageName)
+    environment: $(Devops.Environment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: HelmInstaller@0
+            displayName: Install Helm
+            inputs:
+              helmversion: $(helmVersion)
+              kubectlVersion: $(kubectlVersion)
+              checkLatestHelmVersion: false
+
+          - task: Kubernetes@1
+            displayName: Login
+            inputs:
+              command: login
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(AWS.serviceConnection.k8s)
+
+          - script: |
+              mkdir $(Agent.TempDirectory)/artifact
+              tar -zxf $(Agent.BuildDirectory)/destination-helm-chart/$(Helm.chartName)-$(Build.BuildId).tgz -C $(Agent.TempDirectory)/artifact
+            displayName: Unzip Chart.tgz
+
+          - script: |
+              ns=$(K8s.Namespace)
+              if [ "$(kubectl get namespace -o custom-columns=name:.metadata.name --no-headers $ns 2> /dev/null)" != "$ns" ]; then
+                echo "Creating namespace $ns"
+                kubectl apply -f $(Agent.TempDirectory)/artifact/$(Helm.chartName)/namespace.yaml
+              else
+                echo "Namespace $ns already exists."
+              fi
+            displayName: Create Namespace
+
+          - task: KubernetesManifest@0
+            displayName: Create ImagePullSecret
+            inputs:
+              action: createSecret
+              namespace: $(K8s.Namespace)
+              secretName: $(K8s.imagePullSecret)
+              dockerRegistryEndpoint: $(Docker.containerRegistry.serviceConnection)
+              kubernetesServiceConnection: $(AWS.serviceConnection.k8s)
+
+          - task: AWSShellScript@1
+            displayName: Helm Upgrade Install
+            inputs:
+              awsCredentials: $(AWS.serviceConnection)
+              autoCreateRepository: true
+              regionName: $(AWS.region)
+              failOnStandardError: true
+              scriptType: "inline"
+              inlineScript: |
+                set -euo pipefail
+                aws ecr get-login-password --region $(AWS.region) | helm registry login --username AWS --password-stdin $(Docker.containerRegistry.url)
+                aws eks --region $(AWS.region) update-kubeconfig --name $(K8s.clusterName)
+                cat <<EOF | helm upgrade $(Helm.releaseName) $(ociHelmRepositoryUrl)/$(Helm.chartName) --debug --install --atomic --version $(Build.BuildId) --namespace $(K8s.Namespace) --values - 2>&1
+                ASPNETCORE_ENVIRONMENT: $(ASPNETCORE_ENVIRONMENT)
+                USE_AWS: true
+                aws:
+                  region: $(AWS.region)
+                  secretName: $(AWS.secretName)
+                k8s:
+                  hostBasePath: $(K8s.hostBasePath)
+                  imagePullSecret: $(K8s.imagePullSecret)
+                  istio:
+                    hosts: $(k8s.istio.hosts)
+                docker:
+                  minReplicas: $(Docker.minReplicas)
+                  maxReplicas: $(Docker.maxReplicas)
+                  cpuAverageUtilization: $(Docker.CpuAverageUtilization)
+                  memoryAverageUtilization: $(Docker.MemoryAverageUtilization)
+                  containerRegistry:
+                    url: $(Docker.containerRegistry.url)
+                    imageRepository: $(Docker.containerRegistry.imageRepository)
+                    imageTag: $(Build.BuildId)
+                resources:
+                  requests:
+                    cpu: $(Resources.requests.cpu)
+                    memory: $(Resources.requests.memory)
+                  limits:
+                    cpu: $(Resources.limits.cpu)
+                    memory: $(Resources.limits.memory)
+                dataDog:
+                  serviceName: $(DataDog.serviceName)
+                  version: $(Build.BuildId)
+                  agentHost: $(DataDog.agentHost)
+                  tags:
+                    clentname: $(DataDog.tags.clientname)
+                    projectname: $(DataDog.tags.projectname)
+                nodeAffinity:
+                  enabled: $(NodeAffinity.enabled)
+                  key: $(NodeAffinity.key)
+                  operator: $(NodeAffinity.operator)
+                  values: $(NodeAffinity.values)
+                EOF
+
+- stage: genarateswagger
+  displayName: Genarate Swagger Spec
+
+  jobs:
+
+  - job: Build
+    displayName: Build and Extract OpenApi json
+
+    steps:
+
+    - task: UseDotNet@2
+      displayName: Use .NET Core sdk 3.1.x
+      inputs:
+        packageType: sdk
+        version: 3.1.x
+        includePreviewVersions: false
+
+    - task: DotNetCoreCLI@2
+      displayName: dotnet restore
+      inputs:
+        command: 'restore'
+        projects: '**/*Api.csproj'
+        feedsToUse: 'select'
+        vstsFeed: '$(AzureDevOps.NugetFeed)'
+
+    - task: DotNetCoreCLI@2
+      displayName: Publish API
+      inputs:
+        command: publish
+        projects: '**/*Api.csproj'
+        arguments: --configuration Debug --no-restore --output $(Build.ArtifactStagingDirectory)/app
+        zipAfterPublish: false
+
+    - task: CmdLine@2
+      displayName: Create specs directory
+      inputs:
+        script: mkdir $(Build.ArtifactStagingDirectory)/specs
+
+    - task: DotNetCoreCLI@2
+      displayName: Install Manifest
+      inputs:
+        command: custom
+        workingDirectory: $(Build.ArtifactStagingDirectory)
+        custom: new
+        arguments: tool-manifest
+
+    - task: DotNetCoreCLI@2
+      displayName: Install Swashbuckle CLI
+      inputs:
+        command: custom
+        workingDirectory: $(Build.ArtifactStagingDirectory)
+        custom: tool
+        arguments: install Swashbuckle.AspNetCore.Cli --version 5.6.3
+
+    - task: DotNetCoreCLI@2
+      displayName: Generate OpenAPI spec document
+      inputs:
+        command: custom
+        workingDirectory: $(Build.ArtifactStagingDirectory)/app/$(appName)
+        custom: swagger
+        arguments: tofile --output $(Build.ArtifactStagingDirectory)/specs/$(appName).v1.json $(Build.ArtifactStagingDirectory)/app/$(appName)/$(appName).dll v1
+    
+    - task: CmdLine@2
+      displayName: Remove unnecessary files for OpenAPI spec
+      inputs:
+        script: |
+          rm -R $(Build.ArtifactStagingDirectory)/app
+          rm -R $(Build.ArtifactStagingDirectory)/.config
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish specs
+      inputs:
+        PathtoPublish: $(Build.ArtifactStagingDirectory)/specs
+        ArtifactName: swagger
+
+- stage: Gateway
+  displayName: Publish API into Amazon API Gateway
+  dependsOn: genarateswagger
+
+  jobs:
+
+  - job: Gateway
+    displayName: Publish API into Amazon API Gateway
+
+    steps:
+
+    - task: DownloadPipelineArtifact@2
+      displayName: Download Specs
+      inputs:
+        artifactName: swagger
+        targetPath: swagger
+
+    - task: AWSShellScript@1
+      displayName: Publish API into Amazon API Gateway
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        failOnStandardError: true
+        scriptType: inline
+        inlineScript: |
+          API_ID=$(aws apigatewayv2 get-apis --output text --query 'Items[?Name==`$(AWS.apiGatewayName)`].ApiId')
+          STAGE_NAME="Default"
+          TEMP_PATH="$(System.DefaultWorkingDirectory)/swagger/currentapiconfig"
+          mkdir $TEMP_PATH
+          CURRENT_CONFIG_FILE="$TEMP_PATH/CURRENT_CONFIG_FILE_$(appName).json"
+          OPENAPI_FILE="$(System.DefaultWorkingDirectory)/swagger/a/specs/$(appName).v1.json"
+          mkdir $TEMP_PATH/extracted
+          
+          aws apigatewayv2 export-api --api-id $API_ID --stage-name $STAGE_NAME --output-type JSON --specification OAS30 $CURRENT_CONFIG_FILE
+          
+          jq '.paths["/$default"]' $CURRENT_CONFIG_FILE > $TEMP_PATH/extracted/temp_path_$(appName).json
+          jq '.components' $CURRENT_CONFIG_FILE > $TEMP_PATH/extracted/temp_components_$(appName).json
+          
+          PATH_JSON=$(cat $TEMP_PATH/extracted/temp_path_$(appName).json)
+          COMPONENTS_JSON=$(cat $TEMP_PATH/extracted/temp_components_$(appName).json)
+          
+          jq --argjson path "$PATH_JSON" '.paths["/$default"] = $path' $OPENAPI_FILE > $TEMP_PATH/openapi_path_$(appName).json
+          jq --argjson components "$COMPONENTS_JSON" '.components = $components' $TEMP_PATH/openapi_path_$(appName).json > $TEMP_PATH/openapi_$(appName)_final.json
+          
+          aws apigatewayv2 reimport-api --body file://$TEMP_PATH/openapi_$(appName)_final.json --api-id $API_ID

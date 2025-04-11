@@ -1,0 +1,240 @@
+trigger:
+  branches:
+    include:
+    - dev
+    - hml
+    - main
+
+variables:
+- name: IsReleasable
+  value: $[ contains(variables['Build.SourceBranch'], 'refs/heads/aws') ]
+- ${{ if eq(variables['build.SourceBranchName'], 'main') }}:
+  - group: sf-credits-points-admin-aws-prd
+- ${{ if eq(variables['build.SourceBranchName'], 'hml') }}:
+  - group: sf-credits-points-admin-aws-hml
+- ${{ if eq(variables['build.SourceBranchName'], 'dev') }}:
+  - group: sf-credits-points-admin-aws-dev
+
+- name: src-chart-dir
+  value: $(Build.SourcesDirectory)/pipeline/chart
+
+- name: dest-chart-dir
+  value: $(Agent.TempDirectory)/chart
+
+- name: chart-package
+  value: $(dest-chart-dir)/$(Helm.chartName)-$(Build.BuildId).tgz
+
+- name: container-registry-oci
+  value: oci://$(ContainerRegistry.url)
+
+- name: container-registry-url
+  value: https://$(ContainerRegistry.url)
+
+pool:
+  vmImage: ubuntu-latest
+
+name: 1.0.$(Rev:r)
+stages:
+- stage: BuildAndPushDockerImage
+  displayName: Docker
+  jobs:
+  - job: BuildAndPushImage
+    displayName: Build & Push Docker Image
+    steps:
+    - task: Docker@2
+      displayName: Build Docker Image
+      inputs:
+        repository: '$(ContainerRegistry.apiImageRepository)'
+        command: 'build'
+        buildContext: .
+        Dockerfile: $(Docker.filePath)
+        tags: $(Docker.imageTag)
+        arguments: '--build-arg PAT=$(System.AccessToken)'
+
+    - task: AWSShellScript@1
+      displayName: Create API Image Repository
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        failOnStandardError: true
+        scriptType: "inline"
+        inlineScript: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names '$(ContainerRegistry.apiImageRepository)' > /dev/null 2>&1 || aws ecr create-repository --region $(AWS.region) --registry-id $(AWS.accountId) --repository-name $(ContainerRegistry.apiImageRepository) --image-tag-mutability $(ContainerRegistry.tagMutability) --image-scanning-configuration scanOnPush=$(ContainerRegistry.scanOnPush) --encryption-configuration encryptionType=$(ContainerRegistry.encryptionType) > /dev/null 2>&1
+
+    - task: ECRPushImage@1
+      displayName: Push Docker Image
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        sourceImageName: $(ContainerRegistry.apiImageRepository)
+        sourceImageTag: $(Docker.imageTag)
+        pushTag: $(Docker.imageTag)
+        repositoryName: $(ContainerRegistry.apiImageRepository)
+
+- stage: PackageAndPushHelm
+  displayName: Helm
+  jobs:
+  - job: PackageAndPushHelm
+    displayName: Package & Push Helm
+    steps:
+
+    - task: HelmInstaller@0
+      displayName: Install
+      inputs:
+        helmversion: $(Helm.version)
+        kubectlVersion: $(Kubectl.version)
+        checkLatestHelmVersion: false
+
+    - task: replacetokens@5
+      displayName: 'Replace tokens in namespace.yaml'
+      inputs:
+        targetFiles: '$(src-chart-dir)/namespace.yaml'
+        encoding: 'auto'
+        tokenPattern: 'default'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        actionOnNoFiles: 'continue'
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        enableTelemetry: true
+
+    - task: replacetokens@5
+      displayName: 'Replace tokens in Chart.yaml'
+      inputs:
+        targetFiles: '$(src-chart-dir)/Chart.yaml'
+        encoding: 'auto'
+        tokenPattern: 'default'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        actionOnNoFiles: 'continue'
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        enableTelemetry: true
+
+    - script: helm lint $(src-chart-dir)
+      displayName: Lint
+
+    - task: AWSShellScript@1
+      displayName: Package & Push
+      inputs:
+        awsCredentials: $(AWS.serviceConnection)
+        regionName: $(AWS.region)
+        failOnStandardError: true
+        scriptType: 'inline'
+        inlineScript: |
+          set -euo pipefail
+          aws ecr get-login-password --region $(AWS.region) | helm registry login --username AWS --password-stdin $(container-registry-url)
+          aws ecr describe-repositories --repository-names '$(Helm.chartName)' > /dev/null 2>&1 || aws ecr create-repository --region $(AWS.region) --registry-id $(AWS.accountId) --repository-name $(Helm.chartName) --image-tag-mutability $(ContainerRegistry.tagMutability) --image-scanning-configuration scanOnPush=$(ContainerRegistry.scanOnPush) --encryption-configuration encryptionType=$(ContainerRegistry.encryptionType)
+          helm package $(src-chart-dir) --version $(Build.BuildId) --app-version $(Build.BuildId) --dependency-update --destination $(dest-chart-dir) --debug 2>&1
+          helm push $(chart-package) $(container-registry-oci) --debug 2>&1
+
+    - script: helm registry logout $(container-registry-url) || true
+      condition: always()
+      displayName: Registry Logout
+
+    - upload: '$(chart-package)'
+      displayName: Upload Artifact
+      artifact: destination-helm-chart
+
+- stage: DeployHelmIntoEks
+  displayName: Kubernetes
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    environment: "$(AzureDevOps.appenv)"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: HelmInstaller@0
+            displayName: Install Helm
+            inputs:
+              helmversion: $(Helm.version)
+              kubectlVersion: $(Kubectl.Version)
+              checkLatestHelmVersion: false
+
+          - task: Kubernetes@1
+            displayName: Login
+            inputs:
+              command: login
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(AWS.serviceConnection.k8s)
+
+          - script: |
+              mkdir $(Agent.TempDirectory)/artifact
+              tar -zxf $(Agent.BuildDirectory)/destination-helm-chart/$(Helm.chartName)-$(Build.BuildId).tgz -C $(Agent.TempDirectory)/artifact
+            displayName: Unzip Chart.tgz
+
+          - script: |
+              ns=$(K8s.namespace)
+              if [ "$(kubectl get namespace -o custom-columns=name:.metadata.name --no-headers $ns 2> /dev/null)" != "$ns" ]; then
+                echo "Creating namespace $ns"
+                kubectl apply -f $(Agent.TempDirectory)/artifact/$(Helm.chartName)/namespace.yaml --validate=false
+              else
+                echo "Namespace $ns already exists."
+              fi
+            displayName: Create Namespace
+
+          - task: KubernetesManifest@0
+            displayName: Create ImagePullSecret
+            inputs:
+              action: createSecret
+              namespace: $(K8s.namespace)
+              secretName: $(K8s.imagePullSecret)
+              dockerRegistryEndpoint: $(AWS.serviceConnection.containerRegistry)
+              kubernetesServiceConnection: $(AWS.serviceConnection.k8s)
+
+          - task: AWSShellScript@1
+            displayName: Helm Upgrade Install
+            inputs:
+                awsCredentials: $(AWS.serviceConnection)
+                autoCreateRepository: true
+                regionName: $(AWS.region)
+                failOnStandardError: true
+                scriptType: 'inline'
+                inlineScript: |
+                  set -euo pipefail
+                  aws ecr get-login-password --region $(AWS.region) | helm registry login --username AWS --password-stdin $(ContainerRegistry.url)
+                  aws eks --region $(AWS.region) update-kubeconfig --name $(K8s.clusterName)
+                  cat <<EOF | helm upgrade $(Helm.releaseName) $(container-registry-oci)/$(Helm.chartName) --debug --install --atomic --version $(Build.BuildId) --namespace $(K8s.namespace) --values - 2>&1
+                  env: $(env)
+                  ASPNETCORE_ENVIRONMENT: $(ASPNETCORE_ENVIRONMENT)
+                  k8s:
+                    imagePullSecret: $(K8s.imagePullSecret)
+                    hostBasePath: $(K8s.host_base_path)
+                    hostPort: $(K8s.host_port)
+                    istio:
+                      hosts: $(K8s.istio.hosts)
+                  containerRegistry:
+                    url: $(ContainerRegistry.url)
+                    apiImageRepository: $(ContainerRegistry.apiImageRepository)
+                    imageTag: $(Docker.imageTag)
+                  autoscaling:
+                    enabled: true
+                    minReplicas: $(K8s.minReplicas)
+                    maxReplicas: $(K8s.maxReplicas)
+                  dataDog:
+                    serviceName: $(DataDog.serviceName)
+                    version: $(Build.BuildId)
+                    agentHost: $(DataDog.agentHost)
+                    tags:
+                      clentname: $(DataDog.tags.clientname)
+                      projectname: $(DataDog.tags.projectname)
+                  EOF
+
+          - script: helm registry logout $(container-registry-url) || true
+            condition: always()
+            displayName: Helm Registry Logout
+
+          - task: Kubernetes@1
+            condition: always()
+            displayName: Logout
+            inputs:
+              command: logout
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(AWS.serviceConnection.k8s)

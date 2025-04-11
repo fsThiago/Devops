@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-{{ .Release.Name }}
+  labels:
+    app: {{ .Release.Name }}
+    version: v1
+spec:
+  replicas: {{ .Values.docker.minReplicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+        version: v1
+    spec:
+      {{- if .Values.nodeAffinity.enabled }}
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: {{ .Values.nodeAffinity.key | quote }}
+                operator: {{ .Values.nodeAffinity.operator | quote }}
+                values:
+                  {{- toYaml (.Values.nodeAffinity.values | default list) | nindent 18 }}
+      {{- end }}
+      containers:
+      - name: container-{{ .Release.Name }}
+        image: "{{ .Values.docker.containerRegistry.url }}/{{ .Values.docker.containerRegistry.imageRepository }}:{{ .Values.docker.containerRegistry.imageTag }}"
+        resources:
+          requests:
+            cpu: {{ .Values.resources.requests.cpu | quote }}
+            memory: {{ .Values.resources.requests.memory | quote }}
+          limits:
+            memory: {{ .Values.resources.limits.memory | quote }}
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            port: 80
+            path: /health
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+        ports:
+        - containerPort: 80
+        env:
+        - name: DD_ENV
+          value: {{ .Values.env | quote }}
+        - name: DD_SERVICE
+          value: {{ .Values.dataDog.serviceName | quote }}
+        - name: DD_VERSION
+          value: {{ .Values.dataDog.version | quote }}
+        - name: DD_AGENT_HOST
+          value: {{ .Values.dataDog.agentHost | quote }}
+        - name: DD_TRACE_AGENT_PORT
+          value: "8126"
+        - name: DD_LOGS_INJECTION
+          value: "true"
+        - name: DD_RUNTIME_METRICS_ENABLED
+          value: "true"
+        - name: DD_TAGS
+          value: "env:{{ .Values.env }},clientname:{{ .Values.dataDog.tags.clientname }},projectname:{{ .Values.dataDog.tags.projectname }}"
+        - name: DD_TRACE_ENABLED
+          value: "true"
+        - name: HOST_BASE_PATH
+          value: {{ .Values.k8s.hostBasePath | quote }}
+        - name: HOST_PORT
+          value: {{ .Values.k8s.hostPort | quote }}
+        - name: HOST
+          value: {{ .Values.k8s.host | quote }}
+        - name: ASPNETCORE_ENVIRONMENT
+          value: {{ .Values.ASPNETCORE_ENVIRONMENT | quote }}
+        - name: USE_AWS
+          value: "true"
+        - name: AWS_REGION
+          value: {{ .Values.aws.region | quote }}
+        - name: AWS_SECRET_NAME
+          value: {{ .Values.aws.secretName | quote }}
+
+      {{- if .Values.k8s.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.k8s.imagePullSecret | quote }}
+      {{- end }}
+

@@ -1,0 +1,46 @@
+env: dev
+
+k8s:
+  imagePullSecret: ecr-secret
+  hostBasePath: myfront
+  hostPort: 80
+  istio:
+    hosts: "host-name"
+
+dataDog:
+  serviceName: service-api
+  version: 1.0.0
+  agentHost: basfagrega-agent.datadog.svc.cluster.local
+  tags:
+    clentname: vertem
+    projectname: conectapontos
+
+docker:
+  minReplicas: 1
+  maxReplicas: 1
+  cpuAverageUtilization: 50
+  memoryAverageUtilization: 50
+  containerRegistry:
+    url: myecr.dkr.ecr.us-east-1.amazonaws.com
+    imageRepository: myimagefront
+    imageTag: latest
+
+nodeAffinity:
+  enabled: false
+  key: xpto
+  operator: In
+  values:
+    - valor1
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1024Mi
+
+istio:
+  enabled: true
+  gatewaySelector:
+    app: istio-ingressgateway

@@ -1,0 +1,31 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: vs-{{ .Release.Name}}
+spec:
+  hosts:
+    - {{ .Values.k8s.istio.hosts }}
+  gateways:
+    - gtw
+  http:
+    - name: {{ .Values.k8s.hostBasePath }}
+      match:
+        - uri:
+            prefix: /{{ .Values.k8s.hostBasePath }}api/
+          ignoreUriCase: true
+        - uri:
+            prefix: /{{ .Values.k8s.hostBasePath }}api
+          ignoreUriCase: true
+        - uri:
+            prefix: /{{ .Values.k8s.hostBasePath }}/
+          ignoreUriCase: true
+        - uri:
+            prefix: /{{ .Values.k8s.hostBasePath }}
+          ignoreUriCase: true
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: svc-{{ .Release.Name}}.{{ .Release.Namespace}}.svc.cluster.local
+            port:
+              number: 80
