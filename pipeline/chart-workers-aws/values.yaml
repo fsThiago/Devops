@@ -1,0 +1,47 @@
+env: dev
+ASPNETCORE_ENVIRONMENT: Development
+
+k8s:
+  replicaCount: 3
+  imagePullSecret: acr-secret
+  hostBasePath: myapi
+  hostPort: 80
+  host: 10.0.0.1
+  istio:
+    hosts: "host-name"
+
+dataDog:
+  serviceName: service-api
+  version: 1.0.0
+  agentHost: myagent-agent.datadog.svc.cluster.local
+  tags:
+    clentname: vertem
+    projectname: my-api
+
+docker:
+  minReplicas: 1
+  maxReplicas: 1
+  containerRegistry:
+    url: myacr.azurecr.io
+    imageRepository: myimageapi
+    imageTag: latest
+
+nodeAffinity:
+  enabled: false
+  key: xpto
+  operator: In
+  values:
+    - valor1
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1024Mi
+
+istio:
+  enabled: true
+  gatewaySelector:
+    app: istio-ingressgateway

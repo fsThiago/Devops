@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob-{{ .Release.Name }}
+  labels:
+    app: {{ .Release.Name }}
+    version: v1
+spec:
+  schedule: "0 10 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: {{ .Release.Name }}
+            version: v1
+          annotations:
+            sidecar.istio.io/inject: "false"
+    spec:
+          restartPolicy: OnFailure  # Set the required restart policy
+      containers:
+          - name: container-{{ .Release.Name }}
+            image: {{ .Values.docker.containerRegistry.url }}/{{ .Values.docker.containerRegistry.imageRepository }}:{{ .Values.docker.containerRegistry.imageTag }}
+        resources:
+          requests:
+                cpu: {{ .Values.resources.requests.cpu }}
+                memory: {{ .Values.resources.requests.memory }}
+          limits:
+                memory: {{ .Values.resources.limits.memory }}
+        imagePullPolicy: IfNotPresent
+        args:
+        - touch hc.txt
+        ports:
+        - containerPort: 80
+        env:
+        - name: DD_ENV
+              value: {{ .Values.env }}
+      imagePullSecrets:
+        - name: {{ .Values.k8s.imagePullSecret }}

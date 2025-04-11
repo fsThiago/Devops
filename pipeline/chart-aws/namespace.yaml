@@ -1,0 +1,7 @@
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: "#{K8s.namespace}#"
+  labels:
+    name: "#{K8s.namespace}#"
+    istio-injection: enabled 
